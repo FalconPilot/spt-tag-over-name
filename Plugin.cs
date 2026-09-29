@@ -1,6 +1,8 @@
 using System;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
 using BepInEx;
 using BepInEx.Configuration;
 using HarmonyLib;
@@ -18,7 +20,7 @@ namespace TagOverName
     /// Tout passe par la reflexion (aucune reference a Assembly-CSharp) : si une classe/un champ est
     /// renomme dans une future version, le mod se desactive proprement et l'indique dans le log.
     /// </summary>
-    [BepInPlugin("com.falconpilot.tagovername", "FalconPilot-TagOverName", "1.0.0")]
+    [BepInPlugin("com.falconpilot.tagovername", "FalconPilot-TagOverName", "1.0.2")]
     public class Plugin : BaseUnityPlugin
     {
         internal static ConfigEntry<bool> HideNameWhenTagged;
@@ -47,6 +49,17 @@ namespace TagOverName
             harmony.Patch(
                 GridViewAccess.UpdateTag,
                 postfix: new HarmonyMethod(typeof(Patches), nameof(Patches.UpdateTagPostfix)));
+
+            if (GridViewAccess.LayoutFixAvailable)
+            {
+                harmony.Patch(
+                    GridViewAccess.ResizeTag,
+                    postfix: new HarmonyMethod(typeof(Patches), nameof(Patches.ResizeTagPostfix)));
+            }
+            else
+            {
+                Log.LogWarning("TagOverName: layout safety net unavailable (members not found); using basic mode only.");
+            }
 
             Log.LogInfo("TagOverName loaded.");
         }
@@ -94,6 +107,47 @@ namespace TagOverName
             }
         }
 
+        // GridItemView.ResizeTag (async) peut laisser le libelle du tag masque et la barre etiree sur toute la
+        // largeur (mesure de Caption.renderedWidth perimee, exception, etc.). Quand la tache vanilla est
+        // terminee, on refait donc nous-memes la mise en page pour les objets tagues : libelle visible,
+        // largeur de la barre = clamp(largeur du texte + 12, 40, largeur de la case - 2), comme le jeu.
+        public static void ResizeTagPostfix(object __instance, Task __result)
+        {
+            try
+            {
+                if (__result == null || !Plugin.HideNameWhenTagged.Value)
+                {
+                    return;
+                }
+
+                // Reprise sur le thread Unity (meme contexte que le Task.Yield() du jeu).
+                __result.ContinueWith(
+                    _ => ApplyTagLayout(__instance),
+                    CancellationToken.None,
+                    TaskContinuationOptions.None,
+                    TaskScheduler.FromCurrentSynchronizationContext());
+            }
+            catch (Exception e)
+            {
+                LogOnce(e);
+            }
+        }
+
+        private static void ApplyTagLayout(object view)
+        {
+            try
+            {
+                if (Plugin.HideNameWhenTagged.Value && GridViewAccess.HasVisibleTag(view))
+                {
+                    GridViewAccess.ForceTagLayout(view);
+                }
+            }
+            catch (Exception e)
+            {
+                LogOnce(e);
+            }
+        }
+
         private static void LogOnce(Exception e)
         {
             if (_errorLogged)
@@ -113,6 +167,8 @@ namespace TagOverName
 
         internal static MethodInfo UpdateItemName;
         internal static MethodInfo UpdateTag;
+        internal static MethodInfo ResizeTag;
+        internal static bool LayoutFixAvailable;
 
         private static FieldInfo _caption;        // TMP : nom court
         private static FieldInfo _tagName;        // TMP : libelle du tag
@@ -121,6 +177,15 @@ namespace TagOverName
         private static PropertyInfo _item;        // ItemView.Item
         private static MethodInfo _getTagComponent; // Item.GetItemComponent<TagComponent>()
         private static FieldInfo _tagComponentName; // TagComponent.Name
+        private static MethodInfo _forceMeshUpdate;  // TMP_Text.ForceMeshUpdate(...) (optionnel)
+        private static object[] _forceMeshUpdateArgs;
+        private static PropertyInfo _preferredWidth; // TMP_Text.preferredWidth
+        private static PropertyInfo _gameObject;     // Component.gameObject
+        private static MethodInfo _setActive;        // GameObject.SetActive(bool)
+        private static PropertyInfo _graphicRect;    // Graphic.rectTransform
+        private static PropertyInfo _sizeDelta;      // RectTransform.sizeDelta
+        private static PropertyInfo _viewRect;       // ItemView.RectTransform
+        private static FieldInfo _vecX, _vecY;       // Vector2.x / .y
 
         internal static bool Init(out string error)
         {
@@ -144,9 +209,26 @@ namespace TagOverName
             _tagComponentName = tag.GetField("Name", Any);
             _captionText = _caption?.FieldType.GetProperty("text", Any);
 
+            // Optionnel : force TextMeshPro a recalculer son rendu apres qu'on a vide le texte, pour que
+            // renderedWidth (lu par ResizeTag une image plus tard) vaille bien 0 et pas l'ancienne valeur.
+            _forceMeshUpdate = _caption?.FieldType.GetMethods(Any)
+                .Where(m => m.Name == "ForceMeshUpdate")
+                .OrderByDescending(m => m.GetParameters().Length)
+                .FirstOrDefault();
+            if (_forceMeshUpdate != null)
+            {
+                // 1er bool (ignoreActiveState) = true, les autres = valeur par defaut / false.
+                _forceMeshUpdateArgs = _forceMeshUpdate.GetParameters()
+                    .Select((p, i) => p.ParameterType == typeof(bool) ? (object)(i == 0)
+                        : p.HasDefaultValue ? p.DefaultValue : null)
+                    .ToArray();
+            }
+
             MethodInfo generic = item.GetMethods(Any).FirstOrDefault(m =>
                 m.Name == "GetItemComponent" && m.IsGenericMethodDefinition && m.GetParameters().Length == 0);
             _getTagComponent = generic?.MakeGenericMethod(tag);
+
+            ResolveLayoutMembers(view);
 
             string missing = string.Join(", ", new (string, object)[]
             {
@@ -168,6 +250,63 @@ namespace TagOverName
             }
 
             return true;
+        }
+
+        // Filet de securite optionnel : si un membre manque, on continue sans (mode de base).
+        private static void ResolveLayoutMembers(Type view)
+        {
+            try
+            {
+                ResizeTag = view.GetMethod("ResizeTag", Any, null, Type.EmptyTypes, null);
+                _preferredWidth = _tagName?.FieldType.GetProperty("preferredWidth", Any);
+                _gameObject = _tagName?.FieldType.GetProperty("gameObject", Any);
+                _setActive = _gameObject?.PropertyType.GetMethod("SetActive", Any, null, new[] { typeof(bool) }, null);
+                _graphicRect = _tagColor?.FieldType.GetProperty("rectTransform", Any);
+                _sizeDelta = _graphicRect?.PropertyType.GetProperty("sizeDelta", Any);
+                _viewRect = view.GetProperty("RectTransform", Any);
+                Type vec = _sizeDelta?.PropertyType;
+                _vecX = vec?.GetField("x", Any | BindingFlags.Public);
+                _vecY = vec?.GetField("y", Any | BindingFlags.Public);
+
+                LayoutFixAvailable =
+                    ResizeTag != null && typeof(Task).IsAssignableFrom(ResizeTag.ReturnType)
+                    && _preferredWidth != null && _setActive != null && _graphicRect != null
+                    && _sizeDelta != null && _viewRect != null && _vecX != null && _vecY != null;
+            }
+            catch (AmbiguousMatchException)
+            {
+                LayoutFixAvailable = false;
+            }
+        }
+
+        // Reproduit la branche "assez de place" de GridItemView.ResizeTag.
+        internal static void ForceTagLayout(object view)
+        {
+            object tagName = _tagName.GetValue(view);
+            object tagColor = _tagColor.GetValue(view);
+            object viewRect = _viewRect.GetValue(view, null);
+            if (IsNull(tagName) || IsNull(tagColor) || IsNull(viewRect))
+            {
+                return;
+            }
+
+            float itemWidth = (float)_vecX.GetValue(_sizeDelta.GetValue(viewRect, null));
+            float max = itemWidth - 2f;
+            if (max < 40f)
+            {
+                return; // case trop etroite : le jeu n'affiche pas non plus le libelle
+            }
+
+            object tagGameObject = _gameObject.GetValue(tagName, null);
+            _setActive.Invoke(tagGameObject, new object[] { true });
+
+            float value = (float)_preferredWidth.GetValue(tagName, null) + 12f;
+            float width = value < 40f ? 40f : (value > max ? max : value);
+
+            object bar = _graphicRect.GetValue(tagColor, null);
+            object size = _sizeDelta.GetValue(bar, null);
+            _vecX.SetValue(size, width); // struct boxe : on modifie la copie...
+            _sizeDelta.SetValue(bar, size, null); // ...puis on la reaffecte
         }
 
         // Meme critere que GridItemView.UpdateTag : le tag n'est affiche que si l'UI du tag existe
@@ -203,10 +342,13 @@ namespace TagOverName
         internal static void SetCaptionText(object view, string text)
         {
             object caption = _caption.GetValue(view);
-            if (!IsNull(caption))
+            if (IsNull(caption))
             {
-                _captionText.SetValue(caption, text, null);
+                return;
             }
+
+            _captionText.SetValue(caption, text, null);
+            _forceMeshUpdate?.Invoke(caption, _forceMeshUpdateArgs);
         }
 
         // UnityEngine.Object surcharge Equals : un objet detruit se comporte comme null.
